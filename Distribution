@@ -32,3 +32,10 @@ group by 1
 having failed_pid >0
 and failed_msg_id >0
 and sent_pid>1000
+
+----msg type%
+select  message_type,
+        count(distinct message_id) as msg_id_failed
+from failed_distribution
+where msg_status='Failed'
+group by 1
