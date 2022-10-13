@@ -27,6 +27,34 @@ where failed_chat_rate >=case when OS_PLATFORM= 'iOS' THEN 0.00002
                               when OS_PLATFORM='Android' then 0.031
                               else null end
 )
+,no_failure as 
+(select *
+from JNING.public.chat_failure t1
+where event_name in ('chat_sent')
+and ds between '2022-09-19' and '2022-09-25'
+and NOT EXISTS (select connection_id_unique
+                                 from JNING.public.chat_failure t2
+                                 where event_name in ('chat_msg_sent_failed' ,'chat_sent_failed')
+                                 and t1.connection_id_unique=t2.connection_id_unique
+                                          )
+)
+--0failure
+select ds,count(distinct profile_id) as no_failure_num
+from no_failure
+group by 1
+
+---0failure paid
+select a.ds,
+       b.PRODUCT_TYPE,
+       count(distinct a.profile_id) as no_failure_num,
+        count(distinct a.profile_id) as paid_no_failure_num
+from no_failure a
+left join purchase_completed b
+on a.profile_id=b.profile_id
+and a.OS_PLATFORM=b.OS_PLATFORM
+and a.event_ts<=b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1,2
 
 ---conversion all & 1+failure
 select a.ds,
