@@ -1,0 +1,34 @@
+set start_d = '2022-09-19';
+set end_d = '2022-09-25';
+
+with failed_distribution as
+  (select  ds,
+          profile_id,
+           message_id,
+          hour(event_ts) as hour,
+          country,
+          OS_PLATFORM,
+          message_type,
+          concat(split(app_version,'.')[0],'.',split(app_version,'.')[1])as app_version,
+          case when event_name in ('chat_sent_failed','chat_msg_sent_failed') then 'Failed'
+               when event_name = 'chat_sent' then 'Sent' end as msg_status
+  from JNING.public.chat_failure
+  where event_name in ('chat_sent_failed','chat_msg_sent_failed','chat_sent')
+  and ds between $start_d and $end_d
+)
+
+-----
+ select country,
+        -- message_type,
+        -- hour,
+       count(distinct case when msg_status='Sent' then profile_id end ) as sent_pid,
+       count(distinct case when msg_status='Failed' then profile_id end) as failed_pid,
+       count(distinct case when msg_status='Sent' then message_id end) as sent_msg_id,
+       count(distinct case when msg_status='Failed' then message_id end) as failed_msg_id,
+       failed_pid/sent_pid as pid_fail_rate,
+       failed_msg_id/sent_msg_id as msg_id_fail_rate
+from failed_distribution
+group by 1
+having failed_pid >0
+and failed_msg_id >0
+and sent_pid>1000

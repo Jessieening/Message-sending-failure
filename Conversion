@@ -1,0 +1,77 @@
+set start_d = '2022-09-19';
+set end_d = '2022-10-02';
+
+with purchase_completed as
+(
+select *,to_timestamp(timestamp) as event_ts
+from "BI_USER"."REPORTING"."PURCHASE_COMPLETED_EVENT"
+where ds between $start_d and $end_d
+and lower(TRANSACTION_TYPE) like 'purchase'
+and lower(PRODUCT_TYPE) in('subscription','micro')
+)
+
+, high_prevalence as
+(select ds,profile_id
+from
+(select ds,OS_PLATFORM, profile_id,
+        count(distinct case when event_name in ('chat_sent_failed','chat_msg_sent_failed') then connection_id_unique end) as failed_chat_num,
+        count(distinct case when event_name in ('chat_sent') then connection_id_unique end) as all_chat_num,
+        failed_chat_num/all_chat_num as failed_chat_rate
+from JNING.public.chat_failure
+where ds between '2022-09-19' and '2022-09-25'
+group by 1,2,3
+having failed_chat_num >0
+and all_chat_num >0
+)a
+where failed_chat_rate >=case when OS_PLATFORM= 'iOS' THEN 0.00002
+                              when OS_PLATFORM='Android' then 0.031
+                              else null end
+)
+
+---conversion all & 1+failure
+select a.ds,
+       b.PRODUCT_TYPE,
+       count(distinct case when a.status='Sent' then b.profile_id end ) as all_paid_num,
+       count(distinct case when a.status='Failed' then b.profile_id end ) as failed_paid_num
+from
+(select *,
+    case when event_name='chat_sent' then 'Sent'
+         when event_name in('chat_msg_sent_failed' ,'chat_sent_failed') then 'Failed'
+         end as status
+from JNING.public.chat_failure
+where event_name in ('chat_sent','chat_msg_sent_failed' ,'chat_sent_failed')
+and ds between '2022-09-19' and '2022-09-25'
+)a
+left join purchase_completed b
+on a.profile_id=b.profile_id
+and a.OS_PLATFORM=b.OS_PLATFORM
+and a.event_ts<=b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1,2
+
+--------high prevalence
+--all
+select ds,count(distinct profile_id)
+from high_prevalence
+group by 1
+
+--- paid high prevalence
+select a.ds,
+       b.PRODUCT_TYPE,
+       count(distinct b.profile_id) as high_pre_paid
+from
+(select *
+ from JNING.public.chat_failure
+ where event_name in ('chat_sent','chat_msg_sent_failed' ,'chat_sent_failed')
+ and ds between '2022-09-19' and '2022-09-25'
+)a
+join high_prevalence c
+on a.profile_id=c.profile_id
+and a.OS_PLATFORM=c.OS_PLATFORM
+and a.ds=c.ds
+left join purchase_completed b
+on a.profile_id=b.profile_id
+and a.OS_PLATFORM=b.OS_PLATFORM
+and a.event_ts<=b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1,2

@@ -1,0 +1,296 @@
+
+set start_d = '2022-09-19';
+set end_d = '2022-10-02';
+
+create or replace table JNING.public.chat_failure as
+(with chat_failure as
+( select
+     auc.ds
+    ,auc.profile_id
+    ,auc.app_category
+    ,auc.OS_PLATFORM
+    ,auc.APP_VERSION
+    ,auc.COUNTRY
+    ,try_cast(evt.params:pii_target_profile_id::text as bigint) as target_profile_id
+    ,params:pii_message_id::text as message_id --only exist in Android for failed msg
+    ,least(evt.profile_id, target_profile_id) || greatest(evt.profile_id, target_profile_id) as connection_id_unique
+    ,concat(evt.profile_id,target_profile_id) as connection_id_with_duplicate
+    ,params:type as message_type
+    ,evt.event_name
+    ,to_timestamp(evt.timestamp) as event_ts
+  from "BI_USER"."REPORTING"."ACTIVE_USER_CLEAN" as auc
+  left join "FLUENTD_EVENTS"."REPORTING"."CLIENT_EVENT_HOURLY" evt
+  on auc.profile_id = evt.profile_id and auc.ds = evt.ds
+  where auc.ds between $start_d and $end_d
+  and evt.event_name in ('chat_msg_sent_failed'-- iOS
+                         ,'chat_sent_failed' --Android
+                         , 'chat_sent' ,'profile_blocked' )
+)
+select * from chat_failure
+)
+
+---prevalence
+select ds,OS_PLATFORM,
+        count(distinct case when event_name in ('chat_sent') then profile_id end )as pid_sent,
+        count(distinct case when event_name in ('chat_sent_failed','chat_msg_sent_failed') then profile_id end) as chat_sent_failed,
+        count(distinct case when event_name in ('chat_sent') then connection_id_unique end )as pid_sent,
+        count(distinct case when event_name in ('chat_sent_failed','chat_msg_sent_failed') then connection_id_unique end) as chat_sent_failed
+from JNING.public.chat_failure
+where ds between '2022-09-19' and '2022-09-25'
+group by 1,2
+
+---resend only in andriod
+select a.ds,
+       count(distinct a.message_id) as all_failed_msg,
+       count(distinct b.message_id) as failed_resnt_msg,
+       avg(timediff(minute, a.event_ts,b.event_ts)) as avg_duration,
+       median(timediff(minute, a.event_ts,b.event_ts)) as median_duration
+from
+(select *
+from  JNING.public.chat_failure
+where event_name in ('chat_msg_sent_failed' ,'chat_sent_failed')
+and ds between '2022-09-19' and '2022-09-25' --one week data
+and OS_PLATFORM='Android'
+)a
+left join
+(select *
+from  JNING.public.chat_failure
+where event_name in ('chat_sent')
+and OS_PLATFORM='Android'
+)b
+on a.profile_id=b.profile_id
+and a.target_profile_id=b.target_profile_id
+and a.message_id=b.message_id
+and a.event_ts<=b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1
+
+-- ---how many times resend to success
+select ds, avg(send_num) as avg_send_try
+from
+(select ds,message_id,count(*) as send_num
+from JNING.public.chat_failure
+where (profile_id,target_profile_id,message_id) in  (select a.profile_id,a.target_profile_id,a.message_id
+                                                       from
+                                                       (select *
+                                                        from  JNING.public.chat_failure
+                                                        where event_name in ('chat_msg_sent_failed' ,'chat_sent_failed')
+                                                        and ds between '2022-09-19' and '2022-09-25' --one week data
+                                                        and OS_PLATFORM='Android'
+                                                        )a
+                                                        join
+                                                        (select *
+                                                        from  JNING.public.chat_failure
+                                                        where event_name in ('chat_sent')
+                                                        and OS_PLATFORM='Android'
+                                                        )b
+                                                        on a.profile_id=b.profile_id
+                                                        and a.target_profile_id=b.target_profile_id
+                                                        and a.message_id=b.message_id
+                                                        and a.event_ts<=b.event_ts
+                                                        and b.event_ts <= DATEADD(day,7,a.event_ts)
+                                                      ) --- failed message sent out successfully within the next 7 days
+and  ds between '2022-09-19' and '2022-09-25'
+and event_name in ('chat_msg_sent_failed' ,'chat_sent_failed')
+group by 1,2)
+group by 1
+
+-----avg/75% reponse time
+select ds,avg(datediff(minute,send_time,reponse_time)),
+        median(datediff(minute,send_time,reponse_time)),
+        percentile_disc(0.75) within group (order by datediff(minute,send_time,reponse_time))
+from
+(select a.ds,a.profile_id,a.target_profile_id,
+        a.event_ts as send_time, min(b.event_ts) as reponse_time
+from
+(select *
+from JNING.public.chat_failure
+where event_name  in ('chat_sent')
+ and ds between '2022-09-19' and '2022-09-25'
+)a ---sender
+left join
+(select *
+from JNING.public.chat_failure
+where event_name  in ('chat_sent')
+  and ds between '2022-09-19' and '2022-10-02'
+)b ---respond
+on a.profile_id=b.target_profile_id
+and a.target_profile_id=b.profile_id
+and a.event_ts < b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1,2,3,4
+)
+group by 1
+
+--one day respond time details
+select ds,concat(profile_id,target_profile_id) as one,
+        --count(distinct concat(profile_id,target_profile_id)) as num,
+        datediff(minute,send_time,reponse_time)
+from
+(select a.ds,a.profile_id,a.target_profile_id,
+        a.event_ts as send_time, min(b.event_ts) as reponse_time
+ from
+(select *
+from JNING.public.chat_failure
+where event_name  in ('chat_sent')
+ and ds = '2022-09-19'
+)a ---sender
+left join
+(select *
+from JNING.public.chat_failure
+where event_name  in ('chat_sent')
+  and ds between '2022-09-19' and '2022-09-25'
+)b ---respond
+--on a.connection_id_unique=b.connection_id_unique
+on a.profile_id=b.target_profile_id
+and a.target_profile_id=b.profile_id
+and a.event_ts < b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1,2,3,4
+
+)
+group by 1,2,3
+
+
+---message type  1+failure
+select  b.ds,
+        b.failed_message_group_type,
+        b.failed_chat_num,
+        d.all_failed_chat_num
+from
+(select ds,
+       case when message_type ='location' then 'location'
+            when message_type in ('photo','album_share','expiring_photo','private_video') then 'photo_video'
+            end as failed_message_group_type,
+       count(distinct connection_id_unique) as failed_chat_num
+from JNING.public.chat_failure
+where event_name in ('chat_msg_sent_failed' ,'chat_sent_failed')
+group by 1,2
+)b
+left join
+(select ds,
+       count(distinct connection_id_unique) as all_failed_chat_num
+from JNING.public.chat_failure
+where event_name  in ('chat_msg_sent_failed' ,'chat_sent_failed')
+group by 1
+)d
+on b.ds=d.ds
+
+--message type  0 failure
+select  a.ds,
+        a.sent_message_group_type,
+        a.sent_chat_num,
+        c.all_sent_chat_num
+from
+(select ds,
+       case when message_type ='location' then 'location'
+            when message_type in ('photo','album_share','expiring_photo','private_video') then 'photo_video'
+            end as sent_message_group_type,
+       count(distinct connection_id_unique) as sent_chat_num
+from JNING.public.chat_failure t1
+where event_name in ('chat_sent')
+and  NOT EXISTS (select connection_id_unique
+                                 from JNING.public.chat_failure t2
+                                 where event_name in ('chat_msg_sent_failed' ,'chat_sent_failed')
+                                 and t1.connection_id_unique=t2.connection_id_unique
+                               ) --0 failure
+group by 1,2
+)a
+left join
+(select ds,
+       count(distinct connection_id_unique) as nofailre_chat_num
+from JNING.public.chat_failure t1
+where event_name in ('chat_sent')
+and  NOT EXISTS (select connection_id_unique
+                                 from JNING.public.chat_failure t2
+                                 where event_name in ('chat_msg_sent_failed' ,'chat_sent_failed')
+                                 and t1.connection_id_unique=t2.connection_id_unique
+                               ) ---0 failure
+group by 1
+)c
+on a.ds=c.ds
+
+---------block
+--recipient
+select a.ds, a.type,
+        count(distinct a.profile_id) as pid_num,
+        count(distinct b.profile_id) as pid_block_num
+from
+(select *,
+        case when event_name='chat_sent' then 'Sent'
+             when event_name in('chat_msg_sent_failed' ,'chat_sent_failed') then 'Failed'
+             end as type
+from JNING.public.chat_failure
+where event_name in ('chat_sent','chat_msg_sent_failed' ,'chat_sent_failed')
+and ds between '2022-09-19' and '2022-09-25' --one week data
+)a
+ left join
+(select *
+from JNING.public.chat_failure
+where event_name in ('profile_blocked')
+)b
+on a.target_profile_id=b.profile_id
+and a.profile_id=b.target_profile_id
+and a.event_ts<=b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1,2
+
+
+--sender
+select a.ds, a.type,
+        count(distinct a.profile_id) as pid_num,
+        count(distinct b.profile_id) as pid_block_num
+from
+(select *,
+       case when event_name='chat_sent' then 'Sent'
+            when event_name in('chat_msg_sent_failed' ,'chat_sent_failed') then 'Failed'
+            end as type
+from JNING.public.chat_failure
+where event_name in ('chat_sent','chat_msg_sent_failed' ,'chat_sent_failed')
+and ds between '2022-09-19' and '2022-09-25' --one week data
+)a
+ left join
+(select *
+from JNING.public.chat_failure
+where event_name in ('profile_blocked')
+)b
+on a.profile_id=b.profile_id
+and a.target_profile_id=b.target_profile_id
+and a.event_ts<=b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1,2
+
+---combined
+select a.ds,a.type,
+        count(distinct a.apid) as pid_num,
+        count(distinct b.profile_id) as pid_num
+from
+(select ds,profile_id as apid,target_profile_id as bpid,connection_id_unique,event_ts,
+        case when event_name='chat_sent' then 'Sent'
+             when event_name in('chat_msg_sent_failed' ,'chat_sent_failed') then 'Failed'
+             end as type
+from JNING.public.chat_failure
+where event_name in ('chat_sent','chat_msg_sent_failed' ,'chat_sent_failed')
+and ds between '2022-09-19' and '2022-09-25' --one week data,
+
+union
+
+select ds,target_profile_id as apid, profile_id as bpid,connection_id_unique,event_ts,
+      case when event_name='chat_sent' then 'Sent'
+           when event_name in('chat_msg_sent_failed' ,'chat_sent_failed') then 'Failed'
+           end as type
+from JNING.public.chat_failure
+where event_name in ('chat_sent','chat_msg_sent_failed' ,'chat_sent_failed')
+and ds between '2022-09-19' and '2022-09-25'
+
+)a --combined
+ left join
+(select *
+from JNING.public.chat_failure
+where event_name in ('profile_blocked')
+)b
+on a.apid=b.profile_id
+and a.bpid=b.target_profile_id
+and a.event_ts<=b.event_ts
+and b.event_ts <= DATEADD(day,7,a.event_ts)
+group by 1,2
