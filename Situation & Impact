@@ -107,12 +107,14 @@ from
 from JNING.public.chat_failure
 where event_name  in ('chat_sent')
  and ds between '2022-09-19' and '2022-09-25'
+ and OS_PLATFORM='Android'
 )a ---sender
 left join
 (select *
 from JNING.public.chat_failure
 where event_name  in ('chat_sent')
   and ds between '2022-09-19' and '2022-10-02'
+  and OS_PLATFORM='Android'
 )b ---respond
 on a.profile_id=b.target_profile_id
 and a.target_profile_id=b.profile_id
